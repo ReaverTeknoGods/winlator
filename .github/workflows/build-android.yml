@@ -175,6 +175,10 @@ jobs:
         run: |
           set -euo pipefail
           version="11.1.28.${GITHUB_RUN_NUMBER}"
+          # Keep release builds above legacy/local Winlator version codes.
+          # Android remembers the previous code when an app is removed with
+          # retained data and rejects a numerically lower official update.
+          version_code=$((1000000 + GITHUB_RUN_NUMBER))
           publish=false
           variant=debug
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ||
@@ -196,7 +200,7 @@ jobs:
               > "$RUNNER_TEMP/teknoparrot-release.keystore"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "version_code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
           echo "variant=$variant" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
