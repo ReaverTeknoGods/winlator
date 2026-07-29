@@ -1,0 +1,383 @@
+name: Build TeknoParrot Winlator Android
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_android:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: winlator-android-build-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      publish: ${{ steps.package.outputs.publish }}
+
+    steps:
+      - name: Check out pinned source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify TeknoParrot source integration
+        shell: pwsh
+        run: |
+          $required = @(
+            'app/app/build.gradle',
+            'app/teknoparrot-bridge/build.gradle',
+            'app/teknoparrot-bridge/src/main/aidl/com/teknoparrot/bridge/v1/ITeknoParrotWinlatorService.aidl',
+            'app/app/src/main/java/com/winlator/teknoparrot/TeknoParrotGuestDiagnosticBackend.java',
+            'native/teknoparrot-bridge/Makefile',
+            'branding/teknoparrot.png'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "The pinned Winlator app submodule is missing $path."
+            }
+          }
+          if (-not (Select-String -Quiet -LiteralPath app/app/build.gradle `
+              -Pattern "applicationId 'com.teknoparrot.winlator'")) {
+            throw 'The pinned app submodule is not the TeknoParrot Winlator package.'
+          }
+          $trackedWinSCard = @(
+            git -C app ls-files -- `
+              app/src/main/assets/teknoparrot/winscard-x86.dll
+          )
+          if ($trackedWinSCard.Count) {
+            throw 'The WinSCard DLL must be built by Actions, not tracked as an asset.'
+          }
+
+      - name: Reject bundled emulator and core runtimes
+        shell: pwsh
+        run: |
+          $tracked = @(
+            git ls-files --recurse-submodules |
+              ForEach-Object { $_.Replace('\', '/') }
+          )
+          $forbidden = @(
+            $tracked | Where-Object {
+              $_ -match '(?i)(?:^|/)(?:OpenParrot[^/]*\.(?:dll|exe)|' +
+                'Tekno[^/]*\.(?:dll|exe)|' +
+                'cxbxr-(?:ldr\.exe|emu\.dll)|' +
+                'pcsx2[^/]*\.(?:apk|exe|dll|so))$' -or
+              $_ -match '(?i)(?:^|/)assets/teknoparrot/runtime(?:/|$)' -or
+              ($_ -match '(?i)\.(?:zip|7z|tar|tgz)$' -and
+               $_ -match '(?i)(?:OpenParrot|TeknoParrot|' +
+                 'TeknoParrotElfLdr2|cxbxr|pcsx2x6)')
+            }
+          )
+          if ($forbidden.Count) {
+            throw "Bundled runtime payloads are forbidden: $($forbidden -join ', ')"
+          }
+
+      - name: Reject runtime embedding implementation
+        shell: pwsh
+        run: |
+          $patterns = @(
+            'TEKNOPARROT_EMBED_RUNTIME',
+            'stageTeknoParrotRuntime',
+            'assets/teknoparrot/runtime/',
+            'locally-built debug cores'
+          )
+          $textExtensions = @(
+            '.aidl', '.c', '.cc', '.cpp', '.gradle', '.h', '.java',
+            '.kts', '.md', '.properties', '.ps1', '.sh', '.txt', '.xml', '.yml', '.yaml'
+          )
+          $sources = @(
+            Get-ChildItem -LiteralPath app/app/src/main -Recurse -File |
+              Where-Object { $_.Extension -in $textExtensions }
+            Get-ChildItem -LiteralPath app/teknoparrot-bridge/src/main -Recurse -File |
+              Where-Object { $_.Extension -in $textExtensions }
+            Get-Item -LiteralPath app/app/build.gradle
+          )
+          $violations = @(
+            foreach ($source in $sources) {
+              foreach ($pattern in $patterns) {
+                if (Select-String -Quiet -SimpleMatch -LiteralPath $source.FullName `
+                    -Pattern $pattern) {
+                  "$($source.FullName): $pattern"
+                }
+              }
+            }
+          )
+          if ($violations.Count) {
+            throw "Runtime embedding details are forbidden:`n$($violations -join "`n")"
+          }
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: app/**/*.gradle*
+
+      - name: Install pinned Android native tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          "$sdkmanager" --install \
+            "cmake;3.22.1" \
+            "ndk;24.0.8215888"
+
+      - name: Install native cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libarchive-tools mingw-w64 make zip zstd
+
+      - name: Inspect every compressed payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(
+            git ls-files --recurse-submodules |
+              grep -Ei '\.(zip|7z|tar|tgz|gz|bz2|xz|zst|tzst|apk|jar|aar)$' ||
+              true
+          )
+          forbidden_name_pattern='(^|/)(OpenParrot[^/]*\.(dll|exe)|Tekno[^/]*\.(dll|exe)|cxbxr-(ldr\.exe|emu\.dll)|pcsx2[^/]*\.(apk|exe|dll|so)|[^/]*\.(pdb|dbg)|[^/]*(debug|checked)[^/]*\.(dll|exe))$'
+          sensitive_content_pattern='TEKNOPARROT_EMBED_RUNTIME|stageTeknoParrotRuntime|assets/teknoparrot/runtime/'
+          for archive in "${archives[@]}"; do
+            entries="$(bsdtar -tf "$archive")"
+            if grep -Eq '(^|/)\.\.(/|$)|^/|^[A-Za-z]:' <<<"$entries"; then
+              echo "Unsafe path found inside compressed payload: $archive" >&2
+              exit 1
+            fi
+            if grep -Eiq "$forbidden_name_pattern" <<<"$entries"; then
+              echo "Forbidden core/debug file found inside compressed payload: $archive" >&2
+              grep -Ei "$forbidden_name_pattern" <<<"$entries" >&2
+              exit 1
+            fi
+            if bsdtar -xOf "$archive" |
+               grep -aEi "$sensitive_content_pattern" >/dev/null; then
+              echo "Runtime-embedding detail found inside compressed payload: $archive" >&2
+              exit 1
+            fi
+          done
+          echo "Inspected ${#archives[@]} compressed payloads."
+
+      - name: Build Windows guest bridge helpers from source
+        run: make -C native/teknoparrot-bridge
+
+      - name: Select package version and signing mode
+        id: package
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="11.1.28.${GITHUB_RUN_NUMBER}"
+          publish=false
+          variant=debug
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ||
+                ("${GITHUB_EVENT_NAME}" == "push" &&
+                 "${GITHUB_REF}" == "refs/heads/main") ]]; then
+            publish=true
+            variant=release
+            for value in \
+              "$KEYSTORE_BASE64" \
+              "$STORE_PASSWORD" \
+              "$KEY_ALIAS" \
+              "$KEY_PASSWORD"; do
+              if [[ -z "$value" ]]; then
+                echo "Production Android signing secrets are required." >&2
+                exit 1
+              fi
+            done
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode \
+              > "$RUNNER_TEMP/teknoparrot-release.keystore"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "variant=$variant" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Build thin ARM64 APK
+        working-directory: app
+        shell: bash
+        env:
+          TEKNOPARROT_REPOSITORY_ROOT: ${{ github.workspace }}
+          TEKNOPARROT_ANDROID_VERSION_NAME: ${{ steps.package.outputs.version }}
+          TEKNOPARROT_ANDROID_VERSION_CODE: ${{ steps.package.outputs.version_code }}
+          TEKNOPARROT_RELEASE_KEYSTORE: ${{ runner.temp }}/teknoparrot-release.keystore
+          TEKNOPARROT_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          TEKNOPARROT_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          TEKNOPARROT_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          if [[ "${{ steps.package.outputs.variant }}" == "release" ]]; then
+            ./gradlew --no-daemon :teknoparrot-bridge:compileReleaseJavaWithJavac \
+              :app:assembleRelease
+          else
+            ./gradlew --no-daemon :teknoparrot-bridge:compileDebugJavaWithJavac \
+              :app:assembleDebug
+          fi
+
+      - name: Verify and stage APK
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          variant="${{ steps.package.outputs.variant }}"
+          source_apk="app/app/build/outputs/apk/${variant}/app-${variant}.apk"
+          asset="TeknoParrotWinlator-${version}-android-arm64.apk"
+          mkdir -p dist
+          cp "$source_apk" "dist/$asset"
+
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 \
+            -maxdepth 1 -type d | sort -V | tail -1)"
+          badging="$("$build_tools/aapt" dump badging "dist/$asset")"
+          grep -F "package: name='com.teknoparrot.winlator'" <<<"$badging"
+          grep -F "versionCode='${{ steps.package.outputs.version_code }}'" <<<"$badging"
+          grep -F "versionName='${version}'" <<<"$badging"
+          [[ "$(grep -c "^native-code: 'arm64-v8a'$" <<<"$badging")" == 1 ]]
+          if grep -q '^launchable-activity:' <<<"$badging"; then
+            echo 'The Winlator companion must not publish a launcher Activity.' >&2
+            exit 1
+          fi
+          "$build_tools/zipalign" -c -P 16 4 "dist/$asset"
+          signer="$("$build_tools/apksigner" verify --verbose --print-certs "dist/$asset")"
+          if [[ "$variant" == release ]] &&
+             grep -Fq 'O=Android, CN=Android Debug' <<<"$signer"; then
+            echo 'A published Winlator APK must not use the Android debug certificate.' >&2
+            exit 1
+          fi
+          manifest="$("$build_tools/aapt" dump xmltree \
+            "dist/$asset" AndroidManifest.xml)"
+          grep -Eq 'android:allowBackup.*0x0' <<<"$manifest"
+          for component in \
+            com.winlator.MainActivity \
+            com.winlator.TeknoParrotProvisioningActivity \
+            com.winlator.teknoparrot.TeknoParrotBridgeService \
+            com.winlator.XServerDisplayActivity \
+            com.winlator.ControlsEditorActivity; do
+            grep -Fq "=\"$component\"" <<<"$manifest"
+          done
+          grep -Fq '="com.teknoparrot.permission.BIND_BRIDGE"' <<<"$manifest"
+
+          mapfile -t entries < <(zipinfo -1 "dist/$asset")
+          required=(
+            assets/teknoparrot/README.md
+            assets/teknoparrot/android-winlator-service-bridge-diagnostics.bat
+            assets/teknoparrot/bridgeguest32.exe
+            assets/teknoparrot/bridgeguest64.exe
+            assets/teknoparrot/pipehelper.exe
+            assets/teknoparrot/pipehelper32.exe
+            assets/teknoparrot/windows-path-bootstrap.exe
+            assets/teknoparrot/winscard-x86.dll
+          )
+          for required_entry in "${required[@]}"; do
+            if ! printf '%s\n' "${entries[@]}" |
+                 grep -Fx "$required_entry" >/dev/null; then
+              echo "Required Winlator helper asset is missing: $required_entry" >&2
+              exit 1
+            fi
+          done
+          controls_count="$(
+            printf '%s\n' "${entries[@]}" |
+              grep -Ec '^assets/inputcontrols/profiles/controls-9[0-9]{3}\.icp$'
+          )"
+          if [[ "$controls_count" != 59 ]]; then
+            echo "Expected 59 TeknoParrot control layouts, found $controls_count." >&2
+            exit 1
+          fi
+
+          mapfile -t forbidden < <(
+            printf '%s\n' "${entries[@]}" | grep -Ei \
+              '(^|/)(assets/teknoparrot/runtime/|OpenParrot[^/]*\.(dll|exe)$|Tekno[^/]*\.(dll|exe)$|cxbxr-(ldr\.exe|emu\.dll)$|pcsx2[^/]*\.(apk|exe|dll|so)$)' \
+              || true
+          )
+          if (( ${#forbidden[@]} != 0 )); then
+            printf 'Forbidden APK payload: %s\n' "${forbidden[@]}" >&2
+            exit 1
+          fi
+
+          sensitive_dex_pattern='TEKNOPARROT_EMBED_RUNTIME|stageTeknoParrotRuntime|assets/teknoparrot/runtime/'
+          while IFS= read -r dex; do
+            if unzip -p "dist/$asset" "$dex" |
+               grep -aEi "$sensitive_dex_pattern" >/dev/null; then
+              echo "Forbidden runtime-embedding detail found in $dex." >&2
+              exit 1
+            fi
+          done < <(printf '%s\n' "${entries[@]}" | grep -E '^classes[0-9]*\.dex$')
+
+          sha256sum "dist/$asset" > "dist/$asset.sha256"
+          bytes="$(stat --format=%s "dist/$asset")"
+          digest="$(cut -d' ' -f1 "dist/$asset.sha256")"
+          cat > "dist/$asset.json" <<EOF
+          {
+            "name": "$asset",
+            "packageIdentity": "com.teknoparrot.winlator",
+            "version": "$version",
+            "size": $bytes,
+            "digest": "sha256:$digest"
+          }
+          EOF
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TeknoParrotWinlator-${{ steps.package.outputs.version }}-${{ steps.package.outputs.variant }}
+          path: dist/*
+          retention-days: 14
+
+  publish_android:
+    if: needs.build_android.outputs.publish == 'true'
+    needs: [ build_android ]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: winlator-android-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified package
+        uses: actions/download-artifact@v4
+        with:
+          name: TeknoParrotWinlator-${{ needs.build_android.outputs.version }}-release
+          path: dist
+
+      - name: Publish rolling Winlator package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag=winlator
+          version="${{ needs.build_android.outputs.version }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "$version" \
+              --notes "Rolling ARM64 TeknoParrot Winlator package from commit $GITHUB_SHA." \
+              --prerelease
+          else
+            gh release edit "$tag" \
+              --title "$version" \
+              --notes "Rolling ARM64 TeknoParrot Winlator package from commit $GITHUB_SHA." \
+              --prerelease
+          fi
+          while IFS= read -r stale; do
+            case "$stale" in
+              TeknoParrotWinlator-*-android-arm64.apk | \
+              TeknoParrotWinlator-*-android-arm64.apk.sha256 | \
+              TeknoParrotWinlator-*-android-arm64.apk.json)
+                gh release delete-asset "$tag" "$stale" --yes
+                ;;
+            esac
+          done < <(
+            gh release view "$tag" --json assets --jq '.assets[].name'
+          )
+          gh release upload "$tag" dist/* --clobber

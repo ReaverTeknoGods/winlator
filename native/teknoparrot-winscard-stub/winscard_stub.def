@@ -1,0 +1,12 @@
+LIBRARY WinSCard
+EXPORTS
+    SCardConnectA=_SCardConnectA@24
+    SCardDisconnect=_SCardDisconnect@8
+    SCardEstablishContext=_SCardEstablishContext@16
+    SCardFreeMemory=_SCardFreeMemory@8
+    SCardListReadersA=_SCardListReadersA@16
+    SCardReleaseContext=_SCardReleaseContext@4
+    SCardStatusA=_SCardStatusA@28
+    SCardTransmit=_SCardTransmit@28
+    g_rgSCardT0Pci DATA
+    g_rgSCardT1Pci DATA
