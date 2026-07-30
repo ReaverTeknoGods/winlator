@@ -174,11 +174,12 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          version="11.1.28.${GITHUB_RUN_NUMBER}"
-          # Keep release builds above legacy/local Winlator version codes.
-          # Android remembers the previous code when an app is removed with
-          # retained data and rejects a numerically lower official update.
-          version_code=$((1000000 + GITHUB_RUN_NUMBER))
+          # A workflow's run counter can restart when its file is recreated,
+          # which makes Android reject an otherwise valid signed update as a
+          # downgrade. UTC epoch seconds are monotonic across workflow history
+          # and remain within Android's signed 32-bit versionCode range.
+          version_code="$(date -u +%s)"
+          version="11.1.28.${version_code}"
           publish=false
           variant=debug
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ||
