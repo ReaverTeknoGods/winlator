@@ -252,10 +252,17 @@ jobs:
           fi
           "$build_tools/zipalign" -c -P 16 4 "dist/$asset"
           signer="$("$build_tools/apksigner" verify --verbose --print-certs "dist/$asset")"
-          if [[ "$variant" == release ]] &&
-             grep -Fq 'O=Android, CN=Android Debug' <<<"$signer"; then
-            echo 'A published Winlator APK must not use the Android debug certificate.' >&2
-            exit 1
+          if [[ "$variant" == release ]]; then
+            if grep -Fq 'O=Android, CN=Android Debug' <<<"$signer"; then
+              echo 'A published Winlator APK must not use the Android debug certificate.' >&2
+              exit 1
+            fi
+            if ! tr '[:upper:]' '[:lower:]' <<<"$signer" |
+                 grep -Fq \
+                   'certificate sha-256 digest: c6d8de6b3b0847465e315b7efbe93fd58e940b7cf727b45322704c80e68ec8f1'; then
+              echo 'Winlator must use the shared TeknoGods Android production certificate.' >&2
+              exit 1
+            fi
           fi
           manifest="$("$build_tools/aapt" dump xmltree \
             "dist/$asset" AndroidManifest.xml)"
