@@ -295,12 +295,25 @@ jobs:
               exit 1
             fi
           done
-          controls_count="$(
+          mapfile -t source_controls < <(
+            find app/src/main/assets/inputcontrols/profiles \
+              -maxdepth 1 -type f -name 'controls-9???.icp' -printf '%f\n' |
+              sort
+          )
+          mapfile -t packaged_controls < <(
             printf '%s\n' "${entries[@]}" |
-              grep -Ec '^assets/inputcontrols/profiles/controls-9[0-9]{3}\.icp$'
-          )"
-          if [[ "$controls_count" != 59 ]]; then
-            echo "Expected 59 TeknoParrot control layouts, found $controls_count." >&2
+              sed -nE \
+                's#^assets/inputcontrols/profiles/(controls-9[0-9]{3}\.icp)$#\1#p' |
+              sort
+          )
+          if (( ${#source_controls[@]} == 0 )); then
+            echo 'The pinned Winlator app contains no TeknoParrot control layouts.' >&2
+            exit 1
+          fi
+          if ! diff -u \
+               <(printf '%s\n' "${source_controls[@]}") \
+               <(printf '%s\n' "${packaged_controls[@]}"); then
+            echo 'Packaged TeknoParrot control layouts do not match the pinned app source.' >&2
             exit 1
           fi
 
