@@ -23,10 +23,10 @@ from the signed TeknoParrotUI client and installs them transactionally in its
 private storage.
 
 The pipe/shared-page/bootstrap helpers and WinSCard compatibility shim are part
-of this Winlator integration. GitHub Actions builds them from the source below
-`native/`; generated Windows binaries remain ignored.
+of this Winlator integration. The TeknoParrot build server builds them from the
+source below `native/`; generated Windows binaries remain ignored.
 
-GitHub Actions also opens every tracked compressed payload, rejects unsafe
+The build server also opens every tracked compressed payload, rejects unsafe
 archive paths, and fails if an archive contains private emulator/core files,
 PDB/debug payloads, or protected-core implementation strings.
 
@@ -40,16 +40,17 @@ TeknoParrotUI Android package:
 - `ANDROID_SIGNING_KEY_ALIAS`
 - `ANDROID_SIGNING_KEY_PASSWORD`
 
-Pull requests and non-default branches build test APKs but cannot publish the
-rolling package. A push to `main` or a manual workflow dispatch requires
-production signing and publishes the verified APK plus size and SHA256
-metadata. Publication replaces the previous Winlator APK and sidecars on the
-rolling tag so the updater can never select a stale matching asset.
+BuilderBill requires production signing and publishes the verified APK plus
+size and SHA256 metadata. Publication replaces the previous Winlator APK and
+sidecars on the rolling tag so the updater can never select a stale matching
+asset. Its local pipeline performs the same build and validation while keeping
+Discord and GitHub publication disabled.
 
 ## Submodule requirement
 
 The TeknoParrot application changes live in the `app` submodule, sourced from
 `ReaverTeknoGods/winlator-app`. Before publication, the application-source
 repository must contain a reviewed commit and the top-level Git link must pin
-that exact commit. GitHub Actions fails closed when the pinned submodule does
-not contain the TeknoParrot bridge source and package identity.
+that exact commit. The build server fails closed when the standalone checkout,
+pinned submodule, and top-level Git link disagree, or when the pinned source
+does not contain the TeknoParrot bridge source and package identity.

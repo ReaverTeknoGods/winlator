@@ -22,6 +22,20 @@ if (-not $installation) {
 $vsDevCmd = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 
+function Get-Sha256 {
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream)) -replace '-', '')
+    }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Invoke-Compiler {
     param(
         [Parameter(Mandatory)] [ValidateSet('x64', 'x86')]
@@ -98,6 +112,6 @@ Get-ChildItem -LiteralPath $outputDirectory -File |
     } |
     Sort-Object Name |
     ForEach-Object {
-        $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        $hash = Get-Sha256 -Path $_.FullName
         Write-Host "$($_.Name) $($_.Length) $hash"
     }
