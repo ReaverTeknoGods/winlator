@@ -2,13 +2,25 @@
 	<img src="logo.png" width="376" height="128" alt="Winlator Logo" />
 </p>
 
+<p align="center">
+	<a href="https://winlator.org/">
+		<img src="https://img.shields.io/badge/winlator-website-42a5f5?style=flat-square" />
+	</a>
+	<a href="https://github.com/brunodev85/winlator/releases">
+		<img src="https://img.shields.io/github/downloads/brunodev85/winlator/v11.2.0/total.svg?style=flat-square&label=downloads@v11.2" />
+	</a>
+	<a href="https://github.com/brunodev85/winlator/stargazers">
+		<img src="https://img.shields.io/github/stars/brunodev85/winlator?style=flat-square&logo=github&color=ffb300" />
+	</a>
+</p>
+
 # Winlator
 
 Winlator is an Android application that lets you to run Windows (x86_64) applications with Wine and Box86/Box64.
 
 # Installation
 
-1. Download and install the APK (Winlator_11.1.apk) from [GitHub Releases](https://github.com/brunodev85/winlator/releases)
+1. Download and install the APK (Winlator_11.2.apk) from [GitHub Releases](https://github.com/brunodev85/winlator/releases)
 2. Launch the app and wait for the installation process to finish
 
 ----
@@ -17,12 +29,13 @@ Winlator is an Android application that lets you to run Windows (x86_64) applica
 [![Play on Youtube](https://img.youtube.com/vi/9E4wnKf2OsI/2.jpg)](https://www.youtube.com/watch?v=9E4wnKf2OsI)
 [![Play on Youtube](https://img.youtube.com/vi/czEn4uT3Ja8/2.jpg)](https://www.youtube.com/watch?v=czEn4uT3Ja8)
 [![Play on Youtube](https://img.youtube.com/vi/eD36nxfT_Z0/2.jpg)](https://www.youtube.com/watch?v=eD36nxfT_Z0)
+[![Play on Youtube](https://img.youtube.com/vi/GHBKmzGmhoo/1.jpg)](https://www.youtube.com/watch?v=GHBKmzGmhoo)
 
 ----
 
 # Useful Tips
 
-- If you are experiencing performance issues, try changing the Box64 preset to `Performance` in Container Settings -> Advanced Tab.
+- If you are experiencing instability issues, try changing the Box64 preset in Container Settings -> Advanced Tab.
 - For applications that use .NET Framework, try installing `Wine Mono` found in Start Menu -> System Tools -> Installers.
 - If some older games don't open, try adding the environment variable `MESA_EXTENSION_MAX_YEAR=2003` in Container Settings -> Environment Variables.
 - Try running the games using the shortcut on the Winlator home screen, there you can define individual settings for each game.
