@@ -105,6 +105,11 @@ Copy-Item -LiteralPath (
 if ($LASTEXITCODE -ne 0) {
     throw 'The Windows borderless-window self-test failed.'
 }
+& (Join-Path $outputDirectory 'windows-path-bootstrap.exe') `
+    --self-test-classic640
+if ($LASTEXITCODE -ne 0) {
+    throw 'The scoped Android classic client self-test failed.'
+}
 
 Get-ChildItem -LiteralPath $outputDirectory -File |
     Where-Object {

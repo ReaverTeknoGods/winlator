@@ -17,6 +17,7 @@ typedef struct window_policy_context
     HWND bootstrap_window;
     BOOL center_windows;
     BOOL hide_window_menu;
+    BOOL classic_640_client;
 } window_policy_context;
 
 typedef struct window_policy_pass
@@ -26,6 +27,7 @@ typedef struct window_policy_pass
     HWND bootstrap_window;
     BOOL center_windows;
     BOOL hide_window_menu;
+    BOOL classic_640_client;
 } window_policy_pass;
 
 static BOOL environment_flag_enabled(const wchar_t* name)
@@ -35,6 +37,14 @@ static BOOL environment_flag_enabled(const wchar_t* name)
     return length > 0 && length < ARRAYSIZE(value) &&
         (value[0] == L'1' || value[0] == L'y' || value[0] == L'Y' ||
          value[0] == L't' || value[0] == L'T');
+}
+
+static BOOL classic_640_client_enabled(void)
+{
+    wchar_t value[8] = { 0 };
+    DWORD length = GetEnvironmentVariableW(
+        L"TP_ANDROID_CLASSIC_640_CLIENT", value, ARRAYSIZE(value));
+    return length == 1 && value[0] == L'1';
 }
 
 static BOOL process_list_contains(
@@ -106,6 +116,9 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
     BOOL process_in_tree;
     BOOL style_changed;
     BOOL menu_changed = FALSE;
+    BOOL correct_classic_client = FALSE;
+    BOOL resize_client = FALSE;
+    wchar_t title[128] = { 0 };
 
     GetWindowThreadProcessId(window, &process_id);
     process_in_tree = window == pass->bootstrap_window ||
@@ -128,6 +141,18 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
     style = GetWindowLongPtrW(window, GWL_STYLE);
     if ((style & WS_CHILD) != 0)
         return TRUE;
+    if (pass->classic_640_client && window != pass->bootstrap_window &&
+        GetWindowTextW(window, title, ARRAYSIZE(title)) > 0 &&
+        wcscmp(title, L"CS Emulation Engine") == 0)
+    {
+        // Only the explicitly selected Android classic preset may correct
+        // this game-owned window. Other titles, helpers, dialogs and native
+        // Windows launches preserve their original client dimensions.
+        correct_classic_client = TRUE;
+        resize_client = client_width != 640 || client_height != 480;
+        client_width = 640;
+        client_height = 480;
+    }
     extended_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
     borderless_style = style &
         ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX |
@@ -156,17 +181,24 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
         target_y = max(0, (screen_height - client_height) / 2);
     }
 
-    if (style_changed)
+    if (style_changed || resize_client)
     {
         // Preserve the game's client resolution. With the non-client frame
-        // gone, the outer dimensions are exactly the original client size.
+        // gone, the outer dimensions match its client. The opt-in classic
+        // preset alone substitutes the reviewed 640x480 client dimensions.
+        RECT target_rectangle;
+        SetRect(&target_rectangle, 0, 0, client_width, client_height);
+        if (correct_classic_client &&
+            !AdjustWindowRectEx(&target_rectangle, (DWORD)borderless_style,
+                GetMenu(window) != NULL, (DWORD)borderless_extended_style))
+            return TRUE;
         SetWindowPos(
             window,
             NULL,
             target_x,
             target_y,
-            client_width,
-            client_height,
+            target_rectangle.right - target_rectangle.left,
+            target_rectangle.bottom - target_rectangle.top,
             SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_FRAMECHANGED);
     }
     else if (pass->center_windows &&
@@ -194,6 +226,7 @@ static DWORD WINAPI window_policy_thread(LPVOID parameter)
     pass.bootstrap_window = context->bootstrap_window;
     pass.center_windows = context->center_windows;
     pass.hide_window_menu = context->hide_window_menu;
+    pass.classic_640_client = context->classic_640_client;
     do
     {
         collect_process_tree(&pass, context->root_process_id);
@@ -335,6 +368,85 @@ cleanup:
         CloseHandle(context.stop_event);
     if (window != NULL)
         DestroyWindow(window);
+    UnregisterClassW(class_name, window_class.hInstance);
+    return result;
+}
+
+static BOOL self_test_client_is(HWND window, int width, int height)
+{
+    RECT client;
+    return GetClientRect(window, &client) &&
+        client.right - client.left == width &&
+        client.bottom - client.top == height;
+}
+
+static int run_classic_640_self_test(void)
+{
+    static const wchar_t class_name[] = L"TeknoParrotClassicClientSelfTest";
+    WNDCLASSW window_class = { 0 };
+    RECT requested = { 0, 0, 1280, 720 };
+    window_policy_pass pass = { 0 };
+    HWND window = NULL;
+    int result = ERROR_GEN_FAILURE;
+
+    window_class.lpfnWndProc = self_test_window_proc;
+    window_class.hInstance = GetModuleHandleW(NULL);
+    window_class.lpszClassName = class_name;
+    if (!RegisterClassW(&window_class))
+        return (int)GetLastError();
+    AdjustWindowRectEx(&requested, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_CLIENTEDGE);
+    window = CreateWindowExW(
+        WS_EX_CLIENTEDGE, class_name, L"CS Emulation Engine",
+        WS_OVERLAPPEDWINDOW, 13, 17,
+        requested.right - requested.left, requested.bottom - requested.top,
+        NULL, NULL, window_class.hInstance, NULL);
+    if (window == NULL)
+        goto cleanup;
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    pass.process_ids[0] = GetCurrentProcessId();
+    pass.process_count = 1;
+    pass.center_windows = TRUE;
+
+    SetEnvironmentVariableW(L"TP_ANDROID_CLASSIC_640_CLIENT", NULL);
+    if (classic_640_client_enabled()) { result = 1; goto cleanup; }
+    pass.classic_640_client = classic_640_client_enabled();
+    apply_window_policy(window, (LPARAM)&pass);
+    if (!self_test_client_is(window, 1280, 720)) { result = 2; goto cleanup; }
+
+    SetEnvironmentVariableW(L"TP_ANDROID_CLASSIC_640_CLIENT", L"true");
+    if (classic_640_client_enabled()) { result = 3; goto cleanup; }
+    SetEnvironmentVariableW(L"TP_ANDROID_CLASSIC_640_CLIENT", L"1");
+    if (!classic_640_client_enabled()) { result = 4; goto cleanup; }
+    pass.classic_640_client = classic_640_client_enabled();
+
+    SetWindowTextW(window, L"Unrelated game window");
+    apply_window_policy(window, (LPARAM)&pass);
+    if (!self_test_client_is(window, 1280, 720)) { result = 5; goto cleanup; }
+
+    SetWindowTextW(window, L"CS Emulation Engine");
+    pass.process_ids[0] = 0;
+    apply_window_policy(window, (LPARAM)&pass);
+    if (!self_test_client_is(window, 1280, 720)) { result = 6; goto cleanup; }
+
+    pass.process_ids[0] = GetCurrentProcessId();
+    pass.bootstrap_window = window;
+    apply_window_policy(window, (LPARAM)&pass);
+    if (!self_test_client_is(window, 1280, 720)) { result = 7; goto cleanup; }
+
+    pass.bootstrap_window = NULL;
+    apply_window_policy(window, (LPARAM)&pass);
+    if (!self_test_client_is(window, 640, 480)) { result = 8; goto cleanup; }
+
+    // Recreated/resized clients must be corrected by later polling passes too.
+    SetWindowPos(window, NULL, 0, 0, 1280, 720,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    apply_window_policy(window, (LPARAM)&pass);
+    if (!self_test_client_is(window, 640, 480)) { result = 9; goto cleanup; }
+    result = 0;
+
+cleanup:
+    SetEnvironmentVariableW(L"TP_ANDROID_CLASSIC_640_CLIENT", NULL);
+    if (window != NULL) DestroyWindow(window);
     UnregisterClassW(class_name, window_class.hInstance);
     return result;
 }
@@ -533,6 +645,8 @@ int wmain(int argc, wchar_t** argv)
 
     if (argc == 2 && wcscmp(argv[1], L"--self-test-borderless") == 0)
         return run_borderless_self_test();
+    if (argc == 2 && wcscmp(argv[1], L"--self-test-classic640") == 0)
+        return run_classic_640_self_test();
 
     if (argc < 3 || argv[1][0] == L'\0' || argv[2][0] == L'\0')
         return ERROR_INVALID_PARAMETER;
@@ -909,7 +1023,7 @@ int wmain(int argc, wchar_t** argv)
         goto cleanup;
     }
 
-    if (environment_flag_enabled(L"TP_BORDERLESS_WINDOW"))
+    if (environment_flag_enabled(L"TP_BORDERLESS_WINDOW") || classic_640_client_enabled())
     {
         window_policy.root_process_id = process_info.dwProcessId;
         window_policy.bootstrap_window = GetConsoleWindow();
@@ -917,6 +1031,7 @@ int wmain(int argc, wchar_t** argv)
             environment_flag_enabled(L"TP_CENTER_WINDOW");
         window_policy.hide_window_menu =
             environment_flag_enabled(L"TP_HIDE_WINDOW_MENU");
+        window_policy.classic_640_client = classic_640_client_enabled();
         window_policy.stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (window_policy.stop_event != NULL)
         {

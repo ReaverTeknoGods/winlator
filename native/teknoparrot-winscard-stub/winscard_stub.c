@@ -119,3 +119,14 @@ __declspec(dllexport) LONG WINAPI SCardFreeMemory(SCARDCONTEXT context, LPCVOID 
     (void)memory;
     return TP_SCARD_S_SUCCESS;
 }
+
+__declspec(dllexport) LONG WINAPI SCardGetAttrib(
+    SCARDHANDLE card, DWORD attributeId, BYTE *attribute, DWORD *attributeLength)
+{
+    (void)card;
+    (void)attributeId;
+    (void)attribute;
+    if (attributeLength != NULL)
+        *attributeLength = 0;
+    return TP_SCARD_E_INVALID_HANDLE;
+}

@@ -4,6 +4,7 @@ EXPORTS
     SCardDisconnect=_SCardDisconnect@8
     SCardEstablishContext=_SCardEstablishContext@16
     SCardFreeMemory=_SCardFreeMemory@8
+    SCardGetAttrib=_SCardGetAttrib@16
     SCardListReadersA=_SCardListReadersA@16
     SCardReleaseContext=_SCardReleaseContext@4
     SCardStatusA=_SCardStatusA@28
