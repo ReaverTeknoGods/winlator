@@ -10,6 +10,20 @@
 #define MIN_GAME_CLIENT_WIDTH 320
 #define MIN_GAME_CLIENT_HEIGHT 200
 
+typedef struct taisen_client_cache
+{
+    HWND window;
+    DWORD pid;
+    DWORD thread;
+    ULONGLONG creation;
+    int client_width;
+    int client_height;
+    int outer_width;
+    int outer_height;
+    BOOL recorded;
+    BOOL blocked;
+} taisen_client_cache;
+
 typedef struct window_policy_context
 {
     DWORD root_process_id;
@@ -18,6 +32,7 @@ typedef struct window_policy_context
     BOOL center_windows;
     BOOL hide_window_menu;
     BOOL classic_640_client;
+    BOOL preserve_taisen_client;
 } window_policy_context;
 
 typedef struct window_policy_pass
@@ -28,6 +43,8 @@ typedef struct window_policy_pass
     BOOL center_windows;
     BOOL hide_window_menu;
     BOOL classic_640_client;
+    BOOL preserve_taisen_client;
+    taisen_client_cache taisen_client;
 } window_policy_pass;
 
 static BOOL environment_flag_enabled(const wchar_t* name)
@@ -97,6 +114,125 @@ static void collect_process_tree(
     CloseHandle(snapshot);
 }
 
+static BOOL taisen_client_preservation_enabled(void)
+{
+    wchar_t value[8] = { 0 };
+    DWORD length = GetEnvironmentVariableW(
+        L"TP_ANDROID_TAISEN_PRESERVE_CLIENT", value, ARRAYSIZE(value));
+    HMODULE ntdll;
+    if (length != 1 || value[0] != L'1')
+        return FALSE;
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    // Ordinary native Windows never enters this new opt-in policy.
+    return ntdll != NULL && GetProcAddress(ntdll, "wine_get_version") != NULL;
+}
+
+static BOOL taisen_window_identity(
+    HWND window, DWORD expected_pid, DWORD* thread, ULONGLONG* creation)
+{
+    wchar_t class_name[128] = { 0 };
+    wchar_t title[128] = { 0 };
+    DWORD pid = 0;
+    DWORD exit_code = 0;
+    HANDLE process;
+    FILETIME created, exited, kernel, user;
+    BOOL valid;
+    if (!IsWindow(window) || GetAncestor(window, GA_ROOT) != window ||
+        GetClassNameW(window, class_name, ARRAYSIZE(class_name)) != 4 ||
+        wcscmp(class_name, L"THG5") != 0 ||
+        GetWindowTextW(window, title, ARRAYSIZE(title)) != 4 ||
+        wcscmp(title, L"THG5") != 0)
+        return FALSE;
+    *thread = GetWindowThreadProcessId(window, &pid);
+    if (*thread == 0 || pid == 0 || pid != expected_pid)
+        return FALSE;
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == NULL)
+        return FALSE;
+    valid = GetProcessTimes(process, &created, &exited, &kernel, &user) &&
+        GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE;
+    CloseHandle(process);
+    if (!valid)
+        return FALSE;
+    *creation = ((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime;
+    return *creation != 0;
+}
+
+static BOOL preserve_taisen_client(
+    window_policy_pass* pass, HWND window, DWORD pid,
+    LONG_PTR style, LONG_PTR extended_style, RECT* client, RECT* outer,
+    int* target_width, int* target_height)
+{
+    taisen_client_cache* cache = &pass->taisen_client;
+    DWORD thread = 0;
+    ULONGLONG creation = 0;
+    int client_width = client->right - client->left;
+    int client_height = client->bottom - client->top;
+    int outer_width = outer->right - outer->left;
+    int outer_height = outer->bottom - outer->top;
+    LONG_PTR chrome = WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX |
+        WS_MAXIMIZEBOX | WS_SYSMENU;
+    LONG_PTR extended_chrome = WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE |
+        WS_EX_STATICEDGE | WS_EX_WINDOWEDGE;
+    if (!pass->preserve_taisen_client || cache->blocked)
+        return FALSE;
+    if (window == pass->bootstrap_window || !process_list_contains(pass, pid) ||
+        (style & WS_CHILD) != 0 ||
+        !taisen_window_identity(window, pid, &thread, &creation))
+    {
+        // Once recorded, a changed/reused HWND never regains this policy.
+        if (cache->recorded && cache->window == window)
+            cache->blocked = TRUE;
+        return FALSE;
+    }
+    if (cache->recorded && (cache->window != window || cache->pid != pid ||
+        cache->thread != thread || cache->creation != creation))
+    {
+        cache->blocked = TRUE;
+        return FALSE;
+    }
+    if (!cache->recorded)
+    {
+        if ((style & WS_CAPTION) != WS_CAPTION || GetMenu(window) != NULL ||
+            client_width != 640 || client_height != 480 ||
+            outer_width != 646 || outer_height != 505)
+        {
+            // The first eligible owned THG5 observation is authoritative.
+            // Never learn later from an initially inflated/unknown window.
+            cache->blocked = TRUE;
+            return FALSE;
+        }
+        cache->window = window;
+        cache->pid = pid;
+        cache->thread = thread;
+        cache->creation = creation;
+        cache->client_width = client_width;
+        cache->client_height = client_height;
+        cache->outer_width = outer_width;
+        cache->outer_height = outer_height;
+        cache->recorded = TRUE;
+        return FALSE;
+    }
+    if ((client_width != cache->client_width ||
+            client_height != cache->client_height) &&
+        (client_width != cache->outer_width ||
+            client_height != cache->outer_height))
+    {
+        // A legitimate new client resolution ends this narrow correction.
+        cache->blocked = TRUE;
+        return FALSE;
+    }
+    if ((style & chrome) != 0 || (extended_style & extended_chrome) != 0 ||
+        GetMenu(window) != NULL ||
+        client_width != cache->outer_width || client_height != cache->outer_height ||
+        outer_width != cache->outer_width || outer_height != cache->outer_height)
+        return FALSE;
+    *target_width = cache->client_width;
+    *target_height = cache->client_height;
+    return TRUE;
+}
+
+
 static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
 {
     window_policy_pass* pass = (window_policy_pass*)parameter;
@@ -118,6 +254,7 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
     BOOL menu_changed = FALSE;
     BOOL correct_classic_client = FALSE;
     BOOL resize_client = FALSE;
+    BOOL taisen_resize_client = FALSE;
     wchar_t title[128] = { 0 };
 
     GetWindowThreadProcessId(window, &process_id);
@@ -127,7 +264,12 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
     // but cross-process SetMenu/FRAMECHANGED during its startup tears down the
     // guest. Cosmetic menu hiding must remain subordinate to game stability.
     if (!process_in_tree)
+    {
+        if (pass->preserve_taisen_client && pass->taisen_client.recorded &&
+            pass->taisen_client.window == window)
+            pass->taisen_client.blocked = TRUE;
         return TRUE;
+    }
     if (!IsWindowVisible(window) || !GetClientRect(window, &client_rectangle) ||
         !GetWindowRect(window, &window_rectangle))
         return TRUE;
@@ -160,6 +302,12 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
     borderless_extended_style = extended_style &
         ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE |
           WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
+    // Only the new exact-title opt-in may preserve a previously measured
+    // native client after the game later reapplies its cached outer rectangle.
+    taisen_resize_client = preserve_taisen_client(pass, window, process_id,
+        style, extended_style, &client_rectangle, &window_rectangle,
+        &client_width, &client_height);
+    resize_client = resize_client || taisen_resize_client;
     if (pass->hide_window_menu && GetMenu(window) != NULL)
         menu_changed = SetMenu(window, NULL);
     style_changed = borderless_style != style ||
@@ -192,6 +340,21 @@ static BOOL CALLBACK apply_window_policy(HWND window, LPARAM parameter)
             !AdjustWindowRectEx(&target_rectangle, (DWORD)borderless_style,
                 GetMenu(window) != NULL, (DWORD)borderless_extended_style))
             return TRUE;
+        if (taisen_resize_client)
+        {
+            RECT fresh_client;
+            RECT fresh_outer;
+            int fresh_width = 0;
+            int fresh_height = 0;
+            if (!GetClientRect(window, &fresh_client) ||
+                !GetWindowRect(window, &fresh_outer) ||
+                !preserve_taisen_client(pass, window, process_id,
+                    GetWindowLongPtrW(window, GWL_STYLE),
+                    GetWindowLongPtrW(window, GWL_EXSTYLE),
+                    &fresh_client, &fresh_outer, &fresh_width, &fresh_height) ||
+                fresh_width != client_width || fresh_height != client_height)
+                return TRUE;
+        }
         SetWindowPos(
             window,
             NULL,
@@ -227,6 +390,8 @@ static DWORD WINAPI window_policy_thread(LPVOID parameter)
     pass.center_windows = context->center_windows;
     pass.hide_window_menu = context->hide_window_menu;
     pass.classic_640_client = context->classic_640_client;
+    pass.preserve_taisen_client = context->preserve_taisen_client;
+    ZeroMemory(&pass.taisen_client, sizeof(pass.taisen_client));
     do
     {
         collect_process_tree(&pass, context->root_process_id);
@@ -1032,6 +1197,7 @@ int wmain(int argc, wchar_t** argv)
         window_policy.hide_window_menu =
             environment_flag_enabled(L"TP_HIDE_WINDOW_MENU");
         window_policy.classic_640_client = classic_640_client_enabled();
+        window_policy.preserve_taisen_client = taisen_client_preservation_enabled();
         window_policy.stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (window_policy.stop_event != NULL)
         {

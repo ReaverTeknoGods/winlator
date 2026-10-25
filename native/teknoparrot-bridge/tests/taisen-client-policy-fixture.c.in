@@ -1,0 +1,210 @@
+ACTUAL_TYPES
+#include <stdio.h>
+#include <string.h>
+
+typedef struct fake_window {
+    RECT client, outer;
+    LONG_PTR style, extended_style;
+    DWORD pid, thread;
+    ULONGLONG creation;
+    BOOL exists, root, visible, process, times, running, client_ok, outer_ok;
+    wchar_t title[32], class_name[32];
+    HMENU menu;
+    int positions, resizes, style_writes, menu_writes;
+    int client_reads, fail_client_on_read, change_creation_on_client_read;
+    UINT last_flags;
+} fake_window;
+static fake_window windows[4];
+static wchar_t environment_value[32];
+static BOOL have_ntdll = TRUE, have_wine = TRUE;
+static int assertions;
+static fake_window* record(HWND h) {
+    int i; for (i=0;i<4;++i) if(h==(HWND)&windows[i]) return &windows[i];
+    return NULL;
+}
+static void reset_window(int index) {
+    fake_window* w=&windows[index]; ZeroMemory(w,sizeof(*w));
+    w->client.right=640;w->client.bottom=480;w->outer.right=646;w->outer.bottom=505;
+    w->style=0x10ca0000;w->pid=9;w->thread=11;w->creation=22;
+    w->exists=w->root=w->visible=w->process=w->times=w->running=w->client_ok=w->outer_ok=TRUE;
+    wcscpy_s(w->title,ARRAYSIZE(w->title),L"THG5");wcscpy_s(w->class_name,ARRAYSIZE(w->class_name),L"THG5");
+}
+static void reset_pass(window_policy_pass* p) {
+    ZeroMemory(p,sizeof(*p));p->process_ids[0]=9;p->process_count=1;p->center_windows=TRUE;p->preserve_taisen_client=TRUE;
+}
+static void dimensions(fake_window* w,int cw,int ch,int ow,int oh) {
+    w->client.left=w->client.top=0;w->client.right=cw;w->client.bottom=ch;
+    w->outer.left=w->outer.top=0;w->outer.right=ow;w->outer.bottom=oh;
+}
+static void check(BOOL ok,const char* message) {
+    ++assertions;if(!ok){fprintf(stderr,"FAIL %d: %s\n",assertions,message);exit(1);}
+}
+static DWORD WINAPI fake_environment(LPCWSTR name,LPWSTR buffer,DWORD capacity) {
+    DWORD n=(DWORD)wcslen(environment_value);(void)name;
+    if(n>=capacity)return n+1;
+    memcpy(buffer,environment_value,(n+1)*sizeof(wchar_t));return n;
+}
+static HMODULE WINAPI fake_module(LPCWSTR name) {(void)name;return have_ntdll?(HMODULE)(ULONG_PTR)1:NULL;}
+static INT_PTR WINAPI fake_wine_version(void) {return 0;}
+static FARPROC WINAPI fake_symbol(HMODULE module,LPCSTR name) {
+    (void)module;return have_wine&&strcmp(name,"wine_get_version")==0?fake_wine_version:NULL;
+}
+static BOOL WINAPI fake_iswindow(HWND h) {fake_window*w=record(h);return w&&w->exists;}
+static HWND WINAPI fake_ancestor(HWND h,UINT kind) {fake_window*w=record(h);(void)kind;return w&&w->root?h:NULL;}
+static int copy_name(LPWSTR buffer,int capacity,const wchar_t* value) {
+    int n=(int)wcslen(value);if(n>=capacity)n=capacity-1;memcpy(buffer,value,(size_t)n*sizeof(wchar_t));buffer[n]=0;return n;
+}
+static int WINAPI fake_class(HWND h,LPWSTR buffer,int capacity) {fake_window*w=record(h);return w?copy_name(buffer,capacity,w->class_name):0;}
+static int WINAPI fake_title(HWND h,LPWSTR buffer,int capacity) {fake_window*w=record(h);return w?copy_name(buffer,capacity,w->title):0;}
+static DWORD WINAPI fake_thread(HWND h,LPDWORD pid) {fake_window*w=record(h);if(pid)*pid=w?w->pid:0;return w?w->thread:0;}
+static HANDLE WINAPI fake_open(DWORD access,BOOL inherit,DWORD pid) {
+    int i;(void)access;(void)inherit;for(i=0;i<4;++i)if(windows[i].pid==pid&&windows[i].process)return(HANDLE)&windows[i];return NULL;
+}
+static BOOL WINAPI fake_times(HANDLE h,LPFILETIME created,LPFILETIME exited,LPFILETIME kernel,LPFILETIME user) {
+    fake_window*w=(fake_window*)h;(void)exited;(void)kernel;(void)user;
+    created->dwLowDateTime=(DWORD)w->creation;created->dwHighDateTime=(DWORD)(w->creation>>32);return w->times;
+}
+static BOOL WINAPI fake_exit(HANDLE h,LPDWORD code) {fake_window*w=(fake_window*)h;*code=w->running?STILL_ACTIVE:0;return TRUE;}
+static BOOL WINAPI fake_close(HANDLE h) {(void)h;return TRUE;}
+static BOOL WINAPI fake_visible(HWND h) {fake_window*w=record(h);return w&&w->visible;}
+static BOOL WINAPI fake_client(HWND h,LPRECT r) {fake_window*w=record(h);if(!w)return FALSE;++w->client_reads;if(!w->client_ok||w->client_reads==w->fail_client_on_read)return FALSE;if(w->client_reads==w->change_creation_on_client_read)++w->creation;*r=w->client;return TRUE;}
+static BOOL WINAPI fake_outer(HWND h,LPRECT r) {fake_window*w=record(h);if(!w||!w->outer_ok)return FALSE;*r=w->outer;return TRUE;}
+static LONG_PTR WINAPI fake_get_style(HWND h,int index) {fake_window*w=record(h);return index==GWL_STYLE?w->style:w->extended_style;}
+static LONG_PTR WINAPI fake_set_style(HWND h,int index,LONG_PTR value) {
+    fake_window*w=record(h);LONG_PTR old=fake_get_style(h,index);if(index==GWL_STYLE)w->style=value;else w->extended_style=value;++w->style_writes;return old;
+}
+static HMENU WINAPI fake_menu(HWND h) {return record(h)->menu;}
+static BOOL WINAPI fake_set_menu(HWND h,HMENU menu) {fake_window*w=record(h);w->menu=menu;++w->menu_writes;return TRUE;}
+static int WINAPI fake_metrics(int index) {return index==SM_CXSCREEN?1280:720;}
+static BOOL WINAPI fake_rect(LPRECT r,int left,int top,int right,int bottom) {r->left=left;r->top=top;r->right=right;r->bottom=bottom;return TRUE;}
+static BOOL WINAPI fake_adjust(LPRECT r,DWORD style,BOOL menu,DWORD extended) {(void)r;(void)style;(void)menu;(void)extended;return TRUE;}
+static BOOL WINAPI fake_position(HWND h,HWND after,int x,int y,int width,int height,UINT flags) {
+    fake_window*w=record(h);int ow=w->outer.right-w->outer.left,oh=w->outer.bottom-w->outer.top;(void)after;
+    ++w->positions;w->last_flags=flags;if(!(flags&SWP_NOSIZE)){ow=width;oh=height;++w->resizes;w->client.right=width;w->client.bottom=height;}
+    w->outer.left=x;w->outer.top=y;w->outer.right=x+ow;w->outer.bottom=y+oh;return TRUE;
+}
+#undef GetWindowLongPtrW
+#undef SetWindowLongPtrW
+#define GetEnvironmentVariableW fake_environment
+#define GetModuleHandleW fake_module
+#define GetProcAddress fake_symbol
+#define IsWindow fake_iswindow
+#define GetAncestor fake_ancestor
+#define GetClassNameW fake_class
+#define GetWindowTextW fake_title
+#define GetWindowThreadProcessId fake_thread
+#define OpenProcess fake_open
+#define GetProcessTimes fake_times
+#define GetExitCodeProcess fake_exit
+#define CloseHandle fake_close
+#define IsWindowVisible fake_visible
+#define GetClientRect fake_client
+#define GetWindowRect fake_outer
+#define GetWindowLongPtrW fake_get_style
+#define SetWindowLongPtrW fake_set_style
+#define GetMenu fake_menu
+#define SetMenu fake_set_menu
+#define GetSystemMetrics fake_metrics
+#define SetRect fake_rect
+#define AdjustWindowRectEx fake_adjust
+#define SetWindowPos fake_position
+
+ACTUAL_METHODS
+
+static void learn(window_policy_pass* p) {
+    ZeroMemory(windows,sizeof(windows));reset_window(0);reset_pass(p);apply_window_policy((HWND)&windows[0],(LPARAM)p);
+    check(p->taisen_client.recorded&&!p->taisen_client.blocked,"actual first callback records original native dimensions");
+    check(windows[0].resizes==1&&windows[0].client.right==640&&windows[0].client.bottom==480,"original generic strip preserves640480");
+}
+static BOOL preserve(window_policy_pass*p,int i) {
+    fake_window*w=&windows[i];int targetw=0,targeth=0;
+    return preserve_taisen_client(p,(HWND)w,w->pid,w->style,w->extended_style,&w->client,&w->outer,&targetw,&targeth);
+}
+static void test_flags(void) {
+    const wchar_t*bad[]={L"",L"0",L"01",L"true",L"1x",L"1 ",L"yes"};size_t i;
+    have_ntdll=have_wine=TRUE;
+    for(i=0;i<ARRAYSIZE(bad);++i){wcscpy_s(environment_value,ARRAYSIZE(environment_value),bad[i]);check(!taisen_client_preservation_enabled(),"strict optin rejects aliases");}
+    wcscpy_s(environment_value,ARRAYSIZE(environment_value),L"1");check(taisen_client_preservation_enabled(),"exact optin andWine accepted");
+    have_wine=FALSE;check(!taisen_client_preservation_enabled(),"nativeWindows noWineexport refused");have_wine=TRUE;have_ntdll=FALSE;check(!taisen_client_preservation_enabled(),"missingntdll refused");have_ntdll=TRUE;
+}
+static void test_exact(void) {
+    window_policy_pass p;fake_window*w=&windows[0];learn(&p);
+    check(p.taisen_client.client_width==640&&p.taisen_client.client_height==480&&p.taisen_client.outer_width==646&&p.taisen_client.outer_height==505,"records observedvalues notXdrawable guesses");
+    dimensions(w,646,505,646,505);apply_window_policy((HWND)w,(LPARAM)&p);
+    check(w->resizes==2&&w->client.right==640&&w->client.bottom==480,"samecachedborderlessoldouter corrected torecordedclient");
+    check(w->outer.left==320&&w->outer.top==120,"existingcenter usesrestorednativeclient");
+    check((w->last_flags&SWP_FRAMECHANGED)!=0&&!(w->last_flags&SWP_NOSIZE),"existingresizepath flags retained");
+    apply_window_policy((HWND)w,(LPARAM)&p);check(w->resizes==2,"alreadycorrect noextranativeresize");
+    dimensions(w,800,600,800,600);apply_window_policy((HWND)w,(LPARAM)&p);
+    check(w->resizes==2&&w->client.right==800&&w->client.bottom==600&&p.taisen_client.blocked,"legit800600 preserved andstickyblock");
+    dimensions(w,646,505,646,505);apply_window_policy((HWND)w,(LPARAM)&p);check(w->resizes==2,"lateroldouter cannotrestart afterlegitresolution");
+}
+static void test_first_observation(void) {
+    window_policy_pass p;int i;int shapes[][4]={{646,505,646,505},{800,600,806,625},{640,480,647,505},{639,480,646,505},{640,481,646,505}};
+    for(i=0;i<(int)ARRAYSIZE(shapes);++i){reset_window(0);reset_pass(&p);windows[0].style=0;dimensions(&windows[0],shapes[i][0],shapes[i][1],shapes[i][2],shapes[i][3]);
+        check(!preserve(&p,0)&&!p.taisen_client.recorded&&p.taisen_client.blocked,"wrongfirstTHG5 metrics neverlearn");
+        reset_window(0);check(!preserve(&p,0)&&!p.taisen_client.recorded,"cannotlearnlater afterunknownfirstobservation");}
+    reset_window(0);reset_pass(&p);windows[0].menu=(HMENU)(ULONG_PTR)1;check(!preserve(&p,0)&&p.taisen_client.blocked,"initialmenu preventsmeasurementlearning");
+}
+static void test_identity(void) {
+    int fault;window_policy_pass p;fake_window*w=&windows[0];
+    for(fault=0;fault<12;++fault){learn(&p);dimensions(w,646,505,646,505);
+        switch(fault){
+            case 0:w->pid=19;break;case 1:++w->thread;break;case 2:++w->creation;break;
+            case 3:wcscpy_s(w->title,ARRAYSIZE(w->title),L"other");break;
+            case 4:wcscpy_s(w->class_name,ARRAYSIZE(w->class_name),L"other");break;
+            case 5:w->exists=FALSE;break;case 6:w->root=FALSE;break;
+            case 7:w->process=FALSE;break;case 8:w->times=FALSE;break;case 9:w->running=FALSE;break;
+            case 10:p.process_count=0;break;case 11:w->pid=0;break;
+        }
+        apply_window_policy((HWND)w,(LPARAM)&p);
+        check(p.taisen_client.blocked&&w->resizes==1,"cachedidentity/cohortfault disables targetedresize");
+        reset_window(0);dimensions(w,646,505,646,505);w->style=0;p.process_count=1;
+        apply_window_policy((HWND)w,(LPARAM)&p);check(w->resizes==0,"identityrestore cannotrestart stickyblockedcache");
+    }
+    learn(&p);reset_window(1);windows[1].pid=19;windows[1].thread=17;windows[1].creation=33;p.process_ids[1]=19;p.process_count=2;
+    check(!preserve(&p,1)&&p.taisen_client.blocked,"secondownedTHG5 HWND stickyblocks onecache");
+    learn(&p);w->client_reads=0;w->fail_client_on_read=2;dimensions(w,646,505,646,505);apply_window_policy((HWND)w,(LPARAM)&p);
+    check(w->resizes==1,"freshrectfailure prevents targetedSetWindowPos");
+    learn(&p);w->client_reads=0;w->change_creation_on_client_read=2;dimensions(w,646,505,646,505);apply_window_policy((HWND)w,(LPARAM)&p);
+    check(w->resizes==1&&p.taisen_client.blocked,"freshcreationdrift prevents targetedSetWindowPos");
+    learn(&p);dimensions(w,646,505,646,505);w->extended_style=WS_EX_CLIENTEDGE;
+    check(!preserve(&p,0),"extendedchrome cannotbeinterpreted asborderlessinflation");
+    learn(&p);dimensions(w,646,505,646,505);w->menu=(HMENU)(ULONG_PTR)1;
+    check(!preserve(&p,0),"menu cannotbeinterpreted asborderlessinflation");
+    learn(&p);dimensions(w,646,505,646,505);w->style=WS_CHILD;check(!preserve(&p,0)&&p.taisen_client.blocked,"childtransition refusescachedidentity");
+    reset_window(0);reset_pass(&p);w->pid=19;apply_window_policy((HWND)w,(LPARAM)&p);
+    check(!p.taisen_client.recorded&&w->positions==0&&w->style_writes==0,"unownedTHG5 nevermutatedorlearned");
+    reset_window(0);reset_pass(&p);p.bootstrap_window=(HWND)w;
+    check(!preserve(&p,0)&&!p.taisen_client.recorded,"bootstrapconsole neverlearned");
+}
+static void test_default_comparison(void) {
+    int mode,geometry,menu;window_policy_pass p;fake_window expected;
+    for(mode=0;mode<4;++mode)for(geometry=0;geometry<3;++geometry)for(menu=0;menu<2;++menu){
+        reset_window(0);reset_pass(&p);p.preserve_taisen_client=FALSE;p.center_windows=mode&1;p.hide_window_menu=(mode&2)!=0;
+        if(geometry==1){windows[0].style=0;dimensions(&windows[0],646,505,646,505);}if(geometry==2)dimensions(&windows[0],800,600,806,625);
+        windows[0].menu=menu?(HMENU)(ULONG_PTR)1:NULL;apply_baseline_window_policy((HWND)&windows[0],(LPARAM)&p);expected=windows[0];
+        reset_window(0);reset_pass(&p);p.preserve_taisen_client=FALSE;p.center_windows=mode&1;p.hide_window_menu=(mode&2)!=0;
+        if(geometry==1){windows[0].style=0;dimensions(&windows[0],646,505,646,505);}if(geometry==2)dimensions(&windows[0],800,600,806,625);
+        windows[0].menu=menu?(HMENU)(ULONG_PTR)1:NULL;apply_window_policy((HWND)&windows[0],(LPARAM)&p);
+        check(memcmp(&expected,&windows[0],sizeof(expected))==0,"disabledscope actualcallback identicaltobaseline");check(!p.taisen_client.recorded&&!p.taisen_client.blocked,"disabledscope cacheuntouched");
+    }
+    for(mode=0;mode<3;++mode){
+        reset_window(0);reset_pass(&p);p.classic_640_client=mode==2;
+        if(mode==0)wcscpy_s(windows[0].title,ARRAYSIZE(windows[0].title),L"foreign");
+        if(mode==1)wcscpy_s(windows[0].class_name,ARRAYSIZE(windows[0].class_name),L"foreign");
+        if(mode==2){wcscpy_s(windows[0].title,ARRAYSIZE(windows[0].title),L"CS Emulation Engine");dimensions(&windows[0],800,600,806,625);}
+        apply_baseline_window_policy((HWND)&windows[0],(LPARAM)&p);expected=windows[0];
+        reset_window(0);reset_pass(&p);p.classic_640_client=mode==2;
+        if(mode==0)wcscpy_s(windows[0].title,ARRAYSIZE(windows[0].title),L"foreign");
+        if(mode==1)wcscpy_s(windows[0].class_name,ARRAYSIZE(windows[0].class_name),L"foreign");
+        if(mode==2){wcscpy_s(windows[0].title,ARRAYSIZE(windows[0].title),L"CS Emulation Engine");dimensions(&windows[0],800,600,806,625);}
+        apply_window_policy((HWND)&windows[0],(LPARAM)&p);
+        check(memcmp(&expected,&windows[0],sizeof(expected))==0,"othergamesincludingclassic640 retainoriginalcallbackbehavior");
+        check(!p.taisen_client.recorded,"nonTHG5 neverlearned evenwithflag");
+    }
+}
+int main(void) {
+    test_flags();test_exact();test_first_observation();test_identity();test_default_comparison();
+    printf("PASS %d actual-native-policy assertions; no realWin32window/processcalls\n",assertions);return 0;
+}
